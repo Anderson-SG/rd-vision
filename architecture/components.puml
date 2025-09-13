@@ -1,0 +1,35 @@
+@startuml Components - People Saturation
+
+title Componentes por serviço
+
+package "Collector Service" {
+  [FrameCapture] as FC
+  [Encoder(JPEG/RAW)] as ENC
+  [Streamer(ZeroMQ/gRPC)] as STR
+}
+
+package "Processor Service" {
+  [FrameConsumer] as CON
+  [Detector(OpenCV DNN)] as DET
+  [Smoother(EMA/SMA)] as SMO
+  [SaturationCalc] as SAT
+}
+package "Metrics Service" {
+  [Metrics API] as MET
+}
+
+database "MetricsDB\n(Postgres)" as MetricsDB
+
+queue "RabbitMQ\n(broker)" as RabbitMQ
+
+FC --> ENC
+ENC --> STR : frame (bytes)
+STR --> CON : stream
+CON --> DET : frame
+DET --> SMO : contagem
+SMO --> SAT : índice saturação
+SAT --> RabbitMQ : publica métricas
+RabbitMQ --> MET : consome métricas
+MET --> MetricsDB : grava/consulta
+
+@enduml

@@ -1,0 +1,91 @@
+@startuml
+hide stereotype
+skinparam componentStyle rectangle
+skinparam wrapWidth 200
+skinparam linetype ortho
+skinparam nodesep 40
+skinparam ranksep 30
+left to right direction
+
+title People Saturation - Deployment (Loja -> Infra RD -> Consumidores)
+
+' === COLUNA 1: EDGE (LOJA) ===
+node "Lojas \"Farmacia\" (~3400)" as Store {
+  artifact "Cameras IP por loja" as Cameras
+  note top of Store
+    Representacao compacta: ~3400 lojas com cameras IP.
+    A coleta pode rodar no edge (por loja) ou centralizada.
+  end note
+}
+
+' === COLUNAS 2..5: INFRA RD (CORP) ===
+node "Infra RD (Corp)" as Infra {
+  package "Ingestao" as Ingest {
+    component "Collector Service" as Collector <<Go/Python/Node>>
+  }
+
+  package "Processamento" as Proc {
+    component "Processor Service" as Processor <<Python + OpenCV>>
+    note right of Processor
+      - OpenCV DNN (YOLO ONNX)
+      - EMA/SMA para saturacao
+      - limiares (amarelo/vermelho)
+    end note
+  }
+
+  package "Mensageria" as Msg {
+    queue "RabbitMQ\n(broker)" as RabbitMQ
+  }
+
+  package "API & Storage" as ApiDb {
+    component "Metrics API" as MetricsAPI
+    database "MetricsDB\n(Postgres)" as MetricsDB
+  }
+
+  package "Consumidores Internos" as Cons {
+    component "Dashboard (Web)" as Dashboard
+    note right of Dashboard
+      Dashboard consome a Metrics API
+      (ex: GET /metrics).
+    end note
+  }
+}
+
+' === COLUNA 6: ECOSSISTEMA EXTERNO ===
+cloud "RD Backend Ecosystem\n(RaiaDrogasil APIs)" as Ecosystem {
+  component "Checkout Service\n(app/site/whatsapp)" as Checkout
+  note left of Checkout
+    Em compras, o Checkout chama
+    GET /metrics?store_candidates para decidir melhor loja
+    (indice de saturacao etc.).
+  end note
+}
+
+' === FLUXO PRINCIPAL (L->R) ===
+Cameras -[#gray]-> Collector : RTSP
+Collector -[#blue]> Processor : \n \n Stream de frames\n<<ZeroMQ ou gRPC>>
+Processor -[#purple]> RabbitMQ : publica metricas/alertas
+RabbitMQ -[#purple]> MetricsAPI : entrega metricas/alertas
+MetricsAPI -[#black]-> MetricsDB : grava/consulta metricas
+Dashboard -[#purple]-> MetricsAPI
+MetricsAPI -[#darkgreen]-> Ecosystem : REST/gRPC (exposto)
+Checkout -[#darkgreen]-> MetricsAPI
+
+' === DICAS DE LAYOUT: “fixar” colunas com links invisiveis ===
+Cameras -[hidden]-> Collector
+Collector -[hidden]-> Processor
+Processor -[hidden]-> RabbitMQ
+RabbitMQ -[hidden]-> MetricsAPI
+MetricsAPI -[hidden]-> Dashboard
+MetricsAPI -[hidden]-> Checkout
+
+legend right
+  == Cores de seta ==
+  RTSP (cinza)        : Ingestao de video
+  Stream (azul)       : Frames (ZeroMQ/gRPC)
+  Metricas (roxo)     : Publicacao/consumo de metricas
+  Persistencia (preto): Escrita/leitura em DB
+  Externo (verde)     : Interface com ecossistema/consumidores
+end legend
+
+@enduml

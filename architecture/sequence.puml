@@ -1,0 +1,24 @@
+@startuml Sequence - People Saturation
+
+autonumber
+actor Camera
+participant Collector
+participant Processor
+participant "Metrics API" as API
+participant "RabbitMQ (broker)" as RabbitMQ
+participant "Metrics API" as API
+participant "MetricsDB (Postgres)" as MetricsDB
+
+Camera -> Collector : frame
+Collector -> Collector : encode (JPEG/RAW)
+Collector -> Processor : stream(frame)\n<<ZeroMQ ou gRPC>>
+Processor -> Processor : backpressure loop
+Processor -> RabbitMQ : publish /metrics
+Processor -> Processor : detect(OpenCV) -> contagem -> EMA/SMA -> saturação
+alt Saturação > limiar
+  Processor -> RabbitMQ : publish /alerts (snapshot metadata)
+  RabbitMQ -> API : deliver /alerts
+  API -> MetricsDB : grava alerta
+end
+
+@enduml
