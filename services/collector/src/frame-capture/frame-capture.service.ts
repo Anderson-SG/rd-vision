@@ -1,9 +1,14 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { HttpService } from '@nestjs/axios';
-import ffmpeg from 'fluent-ffmpeg';
-import { firstValueFrom } from 'rxjs';
+import { spawn, spawnSync } from 'child_process';
 import FormData from 'form-data';
+import { firstValueFrom } from 'rxjs';
 
 interface FramePayload {
   timestamp: string; // ISO
@@ -15,11 +20,13 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(FrameCaptureService.name);
   private interval?: NodeJS.Timeout;
   private consecutiveFailures = 0;
+  private probedFormats: Set<string> | null = null;
+  private resolvedFfmpegPath: string = 'ffmpeg';
 
   constructor(
     private readonly http: HttpService,
     private readonly config: ConfigService,
-  ) { }
+  ) {}
 
   onModuleInit() {
     const enabled = this.isCaptureEnabled();
@@ -28,8 +35,30 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const everyMs = this.getIntervalMs();
-    this.logger.log(`Starting frame capture every ${everyMs}ms`);
-    this.interval = setInterval(() => this.captureAndSend().catch(err => this.logger.error(err)), everyMs);
+    this.initializeFfmpegAndLog(everyMs);
+    this.interval = setInterval(() =>
+      this.captureAndSend().catch(err => this.logger.error(err)), everyMs);
+  }
+
+  private initializeFfmpegAndLog(everyMs: number) {
+    // Set ffmpeg path if provided
+    const customFfmpegPath = this.config.get<string>('FFMPEG_PATH');
+    if (customFfmpegPath) {
+      this.resolvedFfmpegPath = customFfmpegPath;
+      this.logger.log(`Usando FFMPEG_PATH='${customFfmpegPath}'`);
+    }
+    const source = this.getSource();
+    const inputFormat = this.getInputFormat(source);
+    const deviceHint = this.config.get<string>('WEBCAM_DEVICE');
+    const explicitFormat = this.config.get<string>('FRAME_INPUT_FORMAT');
+    this.logger.log(`Frame capture starting every ${everyMs}ms | source='${source}' | format='${inputFormat}'` + (explicitFormat ? ' (explicit)' : '') + (deviceHint ? ` deviceHint='${deviceHint}'` : ''));
+    this.logger.debug(`Runtime platform=${process.platform} arch=${process.arch}`);
+    this.probeFormats();
+    if (inputFormat && this.probedFormats && !this.probedFormats.has(inputFormat)) {
+      this.logger.error(`Formato '${inputFormat}' não encontrado em 'ffmpeg -formats'.`);
+      if (process.platform === 'darwin' && inputFormat === 'avfoundation') this.logger.warn('brew install ffmpeg  (garanta suporte avfoundation)');
+      if (process.platform === 'linux' && inputFormat === 'v4l2') this.logger.warn('apt install ffmpeg  (ou equivalente)');
+    }
   }
 
   onModuleDestroy() {
@@ -38,18 +67,6 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
 
   private async captureAndSend() {
     const source = this.getSource();
-    const processorUrl = this.config.get<string>('PROCESSOR_URL') || 'http://localhost:3001';
-
-    // Capturar um frame único em JPEG usando ffmpeg
-    // Preflight se for URL HTTP
-    if (source.startsWith('http')) {
-      const ok = await this.preflightHttp(source);
-      if (!ok) {
-        this.handleFailure(`Preflight falhou para ${source}`);
-        return;
-      }
-    }
-
     const buffer = await this.captureSingleFrame(source);
     if (!buffer) return;
 
@@ -66,11 +83,16 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
 
     form.append('timestamp', timestamp);
     try {
-      // await firstValueFrom(this.http.post(`${processorUrl}/frames/multipart`, form, {
-      //   headers: form.getHeaders(),
-      //   maxBodyLength: Infinity,
-      // }));
-      this.logger.debug(`Frame enviado multipart (${(buffer.length / 1024).toFixed(1)}KB)`);
+      const processorUrl = this.config.get<string>('PROCESSOR_URL');
+      if (!processorUrl) {
+        this.logger.warn('PROCESSOR_URL não definido, pulando envio de frame');
+        return;
+      }
+      // Placeholder: sending disabled intentionally. Uncomment when endpoint available.
+      await firstValueFrom(this.http.post(`${processorUrl}/frames/multipart`, form, { headers: form.getHeaders(), maxBodyLength: Infinity }));
+      this.logger.debug(
+        `Frame capturado (${(buffer.length / 1024).toFixed(1)}KB)`,
+      );
       this.consecutiveFailures = 0;
     } catch (e: any) {
       this.handleFailure(`Falha ao enviar frame multipart: ${e.message}`);
@@ -78,36 +100,95 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
   }
 
   private captureSingleFrame(source: string): Promise<Buffer | null> {
-    // Usamos ffmpeg para capturar 1 frame
-    return new Promise((resolve) => {
-      let data: Buffer[] = [];
-      // Dependendo da plataforma, input format pode variar. Assumindo v4l2 em Linux.
-      const chain = ffmpeg().input(source);
-      if (source.startsWith('/dev/video')) {
-        chain.inputOptions(['-f v4l2']);
-      }
-      chain
-        .frames(1)
-        .format('mjpeg')
-        .on('error', (err: Error) => {
-          this.logger.error(`Erro ffmpeg: ${err.message}`);
-          resolve(null);
-        })
-        .on('end', () => {
-          resolve(Buffer.concat(data));
-        })
-        .pipe() // retorna Readable stream
-        .on('data', (chunk: Buffer) => data.push(chunk))
-        .on('error', (err: Error) => {
-          this.logger.error(`Stream erro: ${err.message}`);
-          resolve(null);
-        });
+    return this.tryCapture(source, true);
+  }
+
+  private async tryCapture(source: string, allowFallback: boolean): Promise<Buffer | null> {
+    const inputFormat = this.getInputFormat(source);
+    const args = this.buildFfmpegArgs(source, inputFormat);
+    this.logger.log(`ffmpeg start: ${this.resolvedFfmpegPath} ${args.join(' ')}`);
+    return new Promise(resolve => {
+      const proc = spawn(this.resolvedFfmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const chunks: Buffer[] = [];
+      let stderr = '';
+      proc.stdout.on('data', d => chunks.push(d));
+      proc.stderr.on('data', d => {
+        const text = d.toString();
+        stderr += text;
+        this.handleCliStderrLines(text, inputFormat, source);
+      });
+      proc.on('error', err => {
+        this.logger.error(`Falha ao iniciar ffmpeg: ${err.message}`);
+        resolve(null);
+      });
+      proc.on('close', code => {
+        if (code === 0 && chunks.length) {
+          return resolve(Buffer.concat(chunks));
+        }
+        if (allowFallback && inputFormat === 'avfoundation' && /Input format avfoundation is not available/i.test(stderr)) {
+          this.logger.warn('Fallback: tentando novamente sem -f avfoundation');
+          return this.tryCapture(source, false).then(resolve);
+        }
+        if (/Selected framerate .* is not supported/i.test(stderr) && allowFallback) {
+          this.logger.warn('Fallback: removendo FRAME_FPS e FRAME_PIXEL_FORMAT e tentando novamente');
+          return this.tryCapture(source, false).then(resolve);
+        }
+        this.logger.error(`ffmpeg exit code ${code}. stderr principal:
+${stderr.split('\n').slice(-15).join('\n')}`);
+        resolve(null);
+      });
     });
   }
 
+  private buildFfmpegArgs(source: string, inputFormat?: string): string[] {
+    const args: string[] = [];
+    // formato explícito
+    if (inputFormat) args.push('-f', inputFormat);
+    const { width, height, fps, pixelFormat } = this.buildCommonValues();
+    if (fps) args.push('-framerate', fps);
+    if (pixelFormat) args.push('-pixel_format', pixelFormat);
+    if (width && height) args.push('-video_size', `${width}x${height}`);
+    // input
+    args.push('-i', source);
+    // Um frame JPEG na saída stdout
+    args.push('-frames:v', '1', '-qscale:v', '2', '-f', 'mjpeg', 'pipe:1');
+    return args;
+  }
+
+  private buildCommonValues() {
+    return {
+      width: this.config.get<string>('FRAME_WIDTH'),
+      height: this.config.get<string>('FRAME_HEIGHT'),
+      fps: this.config.get<string>('FRAME_FPS'),
+      pixelFormat: this.config.get<string>('FRAME_PIXEL_FORMAT'),
+    };
+  }
+
+  // (Mantivemos buildCommonValues para args.)
+
+  private handleCliStderrLines(chunk: string, inputFormat: string | undefined, source: string) {
+    for (const line of chunk.split(/\r?\n/)) {
+      if (!line) continue;
+      if (/Input format .* not available/i.test(line)) {
+        this.logger.error(`Formato indisponível '${inputFormat}': ${line}`);
+      } else if (/No such file or directory/i.test(line)) {
+        this.logger.error(`Dispositivo inexistente '${source}'`);
+      } else if (/Selected framerate .* is not supported/i.test(line)) {
+        this.logger.warn('Framerate não suportado. Ajustar FRAME_FPS (ex: 30 ou 15).');
+      } else if (/Supported modes:/i.test(line)) {
+        this.logger.debug('Modos suportados listados a seguir (avfoundation).');
+      }
+      this.logger.verbose?.(line);
+    }
+  }
+
+  private suggestFormatFix(_inputFormat?: string) { /* Simplified / no-op for CLI version */ }
+
   // Helpers de configuração
   private isCaptureEnabled(): boolean {
-    const raw = this.config.get<string>('ENABLE_CAPTURE', 'true')?.toLowerCase();
+    const raw = this.config
+      .get<string>('ENABLE_CAPTURE', 'true')
+      ?.toLowerCase();
     return raw !== 'false' && raw !== '0';
   }
 
@@ -122,38 +203,61 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
   }
 
   private getSource(): string {
-    const url = this.config.get<string>('FRAME_SOURCE_URL');
-    if (url) {
-      this.logger.debug(`Usando FRAME_SOURCE_URL=${url}`);
-      return url;
-    }
-    return this.config.get<string>('WEBCAM_DEVICE', '/dev/video0');
+    // Apenas dispositivo local (sem URLs). WEBCAM_DEVICE tem precedência.
+    const device = this.config.get<string>('WEBCAM_DEVICE');
+    if (device) return this.normalizeDevice(device);
+    if (process.platform === 'linux') return '/dev/video0';
+    if (process.platform === 'darwin') return '0';
+    if (process.platform === 'win32') return '0';
+    return '/dev/video0';
   }
 
-  // Preflight HTTP simples para detectar conexão recusada antes de invocar ffmpeg
-  private async preflightHttp(url: string): Promise<boolean> {
+  private normalizeDevice(value: string): string {
+    // macOS: permitir número simples ou par video:audio
+    if (process.platform === 'darwin') {
+      if (/^\d(:\d)?$/.test(value)) return value; // já está no formato esperado
+      // Se for fornecido como '0,1' converter para '0:1'
+      if (/^\d,\d$/.test(value)) return value.replace(',', ':');
+    }
+    return value; // Linux/Windows ficam como estão
+  }
+
+  private getInputFormat(source: string): string | undefined {
+    const manual = this.config.get<string>('FRAME_INPUT_FORMAT');
+    if (manual) return manual;
+    if (source.startsWith('/dev/video')) return 'v4l2';
+    if (process.platform === 'darwin' && /^\d(:\d)?$/.test(source)) return 'avfoundation';
+    if (process.platform === 'win32') return 'dshow';
+    return undefined;
+  }
+
+  private probeFormats() {
+    if (this.probedFormats) return; // já feito
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(url, { method: 'GET', signal: controller.signal });
-      clearTimeout(timeout);
-      if (!res.ok) {
-        this.logger.warn(`Preflight HTTP status ${res.status} para ${url}`);
+  const ff = spawnSync(this.resolvedFfmpegPath, ['-hide_banner', '-formats'], { encoding: 'utf-8' });
+      if (ff.error) {
+        this.logger.warn(`Não foi possível executar ffmpeg para detectar formatos: ${ff.error.message}`);
+        return;
       }
-      return true; // mesmo status não 200 deixamos ffmpeg tentar (pode ser stream que não responde OK)
+      const out = ff.stdout + ff.stderr; // alguns builds imprimem em stderr
+      const set = new Set<string>();
+      // linhas possuem: ' DE ai      AIFC Audio Interchange File Format (AIFF-C)' ou ' D  avfoundation    AVFoundation input device'
+      for (const line of out.split(/\r?\n/)) {
+        const m = line.match(/\b([a-z0-9_]{3,})\b\s+/i);
+        if (m) set.add(m[1]);
+      }
+      this.probedFormats = set;
+      this.logger.debug(`Formatos ffmpeg detectados: ${set.size}`);
     } catch (err: any) {
-      this.logger.error(`Preflight erro: ${err.message}`);
-      return false;
+      this.logger.warn(`Falha ao detectar formatos ffmpeg: ${err.message}`);
     }
   }
+
+  // Preflight removido – não há suporte a URLs agora.
 
   private handleFailure(message: string) {
     this.consecutiveFailures++;
     this.logger.error(message);
-    if (this.consecutiveFailures === 3) {
-      this.logger.warn('3 falhas consecutivas. Verifique se o VLC está servindo a URL e acessível do WSL.');
-      this.logger.warn('Dica VLC: Media > Stream > selecione dispositivo > Configure destino HTTP porta 8080, path /live, sem autenticação, formato MJPEG ou H264.');
-      this.logger.warn('No WSL, tente: curl -v http://localhost:8080/live para validar acesso direto.');
-    }
+    // Mensagens relacionadas a streaming removidas.
   }
 }

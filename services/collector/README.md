@@ -96,3 +96,124 @@ Nest is an MIT-licensed open source project. It can grow thanks to the sponsors 
 ## License
 
 Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+
+---
+
+## Frame Capture (ffmpeg)
+
+This service can capture a single JPEG frame periodically from a webcam or network stream using `ffmpeg`.
+
+### Implementation Note
+
+Atualmente a captura usa execução direta do binário `ffmpeg` (CLI) via `child_process.spawn`, não mais a API do `fluent-ffmpeg`, devido a inconsistências na detecção de `avfoundation` em macOS. Após validar em produção/local, a dependência `fluent-ffmpeg` poderá ser removida do `package.json` para reduzir superfície.
+
+### Requirements
+
+You must have a working `ffmpeg` binary in the container/host `PATH` with the appropriate input device demuxers:
+
+- Linux: `v4l2`
+- macOS: `avfoundation`
+- Windows: `dshow`
+
+Check available input formats:
+
+```bash
+ffmpeg -formats | grep -E 'v4l2|avfoundation|dshow'
+```
+
+List devices (examples):
+
+```bash
+# Linux (video devices)
+ls /dev/video*
+
+# macOS (list avfoundation devices)
+ffmpeg -f avfoundation -list_devices true -i ''
+
+# Windows (list DirectShow devices)
+ffmpeg -list_devices true -f dshow -i dummy
+```
+
+### Environment Variables
+
+| Variable | Description | Default (by platform) |
+|----------|-------------|------------------------|
+| `ENABLE_CAPTURE` | Disable/enable frame capture | `true` |
+| `FRAME_INTERVAL_MS` | Interval between captures | `1000` |
+| `WEBCAM_DEVICE` | Device index/path (e.g. `0`, `/dev/video0`) | Linux: `/dev/video0`, macOS: `0`, Windows: `0` |
+| `FRAME_INPUT_FORMAT` | Force input format (`v4l2`, `avfoundation`, `dshow`) | Auto-detected |
+| `FRAME_WIDTH` / `FRAME_HEIGHT` | Optional resolution hint for `v4l2` | unset |
+| `FFMPEG_PATH` | Absolute path to ffmpeg binary to override PATH | system `ffmpeg` |
+| `FRAME_FPS` | Desired capture framerate (device negotiation) | device default |
+| `FRAME_PIXEL_FORMAT` | Pixel format (e.g. `uyvy422`, `yuyv422`, `nv12`) for avfoundation | unset |
+
+Auto-detection logic (somente dispositivo local):
+
+1. Manual override via `FRAME_INPUT_FORMAT`.
+2. Caminho `/dev/video*` -> `v4l2`.
+3. macOS valor numérico (`0` ou `0:1`) -> `avfoundation`.
+4. Windows -> `dshow`.
+
+### Examples
+
+Linux USB cam:
+```bash
+ENABLE_CAPTURE=true \
+WEBCAM_DEVICE=/dev/video0 \
+FRAME_INTERVAL_MS=1000 pnpm run start:dev
+```
+
+macOS built-in camera:
+```bash
+ENABLE_CAPTURE=true \
+WEBCAM_DEVICE=0 \
+FRAME_INTERVAL_MS=1500 pnpm run start:dev
+```
+
+Force format (if auto-detect fails):
+```bash
+FRAME_INPUT_FORMAT=avfoundation WEBCAM_DEVICE=0 pnpm run start:dev
+```
+
+### Troubleshooting
+
+Error: `Input format v4l2 is not available` on macOS:
+- Set `FRAME_INPUT_FORMAT=avfoundation` and `WEBCAM_DEVICE=0`.
+- Confirm ffmpeg has avfoundation: `ffmpeg -formats | grep avfoundation`.
+
+Error: `Input format avfoundation is not available` even though `ffmpeg -formats` shows it:
+- Node process may be using another ffmpeg in PATH (older build). Run `which ffmpeg` inside the service context.
+- Force binary: `FFMPEG_PATH=$(which ffmpeg) pnpm run start:dev`.
+- Ensure Homebrew ffmpeg install includes avfoundation (it usually does by default).
+
+Error: `No such file or directory` referencing `/dev/video0`:
+- Device path incorrect or permissions (Linux). Check `ls -l /dev/video*`.
+
+Low quality / wrong resolution:
+- Provide `FRAME_WIDTH` and `FRAME_HEIGHT` (Linux v4l2 only). Example: `FRAME_WIDTH=1280 FRAME_HEIGHT=720`.
+
+Verbose ffmpeg logging (temporary): modify log level in code or add extra `.on('stderr')` filtering.
+
+### macOS (avfoundation) notas
+
+Se você ver:
+```
+Selected framerate (29.970030) is not supported by the device.
+Supported modes:
+  1920x1080@[15.000000 30.000000]fps
+  1280x720@[15.000000 30.000000]fps
+  ...
+```
+Defina um FPS suportado (ex: 30 ou 15) e, opcionalmente, a resolução:
+```bash
+FRAME_INPUT_FORMAT=avfoundation \
+WEBCAM_DEVICE=0 \
+FRAME_FPS=30 \
+FRAME_WIDTH=1280 FRAME_HEIGHT=720 pnpm run start:dev
+```
+Se ainda falhar, tente outro pixel format (ex: `FRAME_PIXEL_FORMAT=uyvy422`). Liste modos e formatos com:
+```bash
+ffmpeg -f avfoundation -list_devices true -i ''
+```
+
+---
