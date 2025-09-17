@@ -59,6 +59,21 @@ Defina `ENABLE_CAPTURE=false` antes de iniciar o collector se quiser iniciar sem
 - Este fluxo envia a imagem completa em Base64 via JSON; para produção considere formatos binários (multipart, gRPC streaming, WebSocket) e compressão.
 - Ajuste opções do ffmpeg no `FrameCaptureService` caso precise de resolução / qualidade específicas.
 
+### Performance: Base64 vs Multipart
+
+Agora há suporte a envio multipart (padrão) definindo `FRAME_TRANSPORT` (default `multipart`).
+
+Comparação:
+
+| Método | Overhead | Simplicidade | Comentário |
+|--------|----------|--------------|------------|
+| JSON + Base64 | ~33% tamanho extra | Muito simples | Evitar para alta taxa de frames |
+| Multipart/form-data | Pequeno (boundary) | Simples | Binário direto, melhor uso de memória |
+| Raw octet-stream | Mínimo | Médio | Precisaria headers custom, pode ser próximo passo |
+| WebSocket/gRPC stream | Baixo após handshake | Maior | Bom para tempo real e controle de fluxo |
+
+Envio JSON legado permanece disponível com `FRAME_TRANSPORT=json-base64`.
+
 ### Próximos passos sugeridos
 
 - Implementar fila (ex: Redis, NATS) para desacoplar captura e processamento.

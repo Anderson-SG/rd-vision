@@ -10,7 +10,7 @@ import { ConfigModule } from '@nestjs/config';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
-    HttpModule.register({ timeout: 5000 }), FrameCaptureModule],
+    FrameCaptureModule],
   controllers: [AppController],
   providers: [AppService],
 })

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { HttpService } from '@nestjs/axios';
 import ffmpeg from 'fluent-ffmpeg';
 import { firstValueFrom } from 'rxjs';
+import FormData from 'form-data';
 
 interface FramePayload {
   timestamp: string; // ISO
@@ -13,6 +14,7 @@ interface FramePayload {
 export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(FrameCaptureService.name);
   private interval?: NodeJS.Timeout;
+  private consecutiveFailures = 0;
 
   constructor(
     private readonly http: HttpService,
@@ -35,34 +37,56 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async captureAndSend() {
-  const device = this.getDevice();
-  const processorUrl = this.config.get<string>('PROCESSOR_URL') || 'http://localhost:3001';
+    const source = this.getSource();
+    const processorUrl = this.config.get<string>('PROCESSOR_URL') || 'http://localhost:3001';
 
     // Capturar um frame único em JPEG usando ffmpeg
-    const buffer = await this.captureSingleFrame(device);
+    // Preflight se for URL HTTP
+    if (source.startsWith('http')) {
+      const ok = await this.preflightHttp(source);
+      if (!ok) {
+        this.handleFailure(`Preflight falhou para ${source}`);
+        return;
+      }
+    }
+
+    const buffer = await this.captureSingleFrame(source);
     if (!buffer) return;
 
-    const payload: FramePayload = {
-      timestamp: new Date().toISOString(),
-      data: buffer.toString('base64'),
-    };
+    const timestamp = new Date().toISOString();
 
+    // Default multipart
+    const form = new FormData();
+
+    form.append('frame', buffer, {
+      filename: `${timestamp}.jpg`,
+      contentType: 'image/jpeg',
+      knownLength: buffer.length,
+    });
+
+    form.append('timestamp', timestamp);
     try {
-      await firstValueFrom(this.http.post(`${processorUrl}/frames`, payload));
-      this.logger.debug(`Frame enviado (${(buffer.length / 1024).toFixed(1)}KB)`);
+      // await firstValueFrom(this.http.post(`${processorUrl}/frames/multipart`, form, {
+      //   headers: form.getHeaders(),
+      //   maxBodyLength: Infinity,
+      // }));
+      this.logger.debug(`Frame enviado multipart (${(buffer.length / 1024).toFixed(1)}KB)`);
+      this.consecutiveFailures = 0;
     } catch (e: any) {
-      this.logger.error(`Falha ao enviar frame: ${e.message}`);
+      this.handleFailure(`Falha ao enviar frame multipart: ${e.message}`);
     }
   }
 
-  private captureSingleFrame(device: string): Promise<Buffer | null> {
+  private captureSingleFrame(source: string): Promise<Buffer | null> {
     // Usamos ffmpeg para capturar 1 frame
     return new Promise((resolve) => {
       let data: Buffer[] = [];
       // Dependendo da plataforma, input format pode variar. Assumindo v4l2 em Linux.
-      ffmpeg()
-        .input(device)
-        .inputOptions(['-f v4l2'])
+      const chain = ffmpeg().input(source);
+      if (source.startsWith('/dev/video')) {
+        chain.inputOptions(['-f v4l2']);
+      }
+      chain
         .frames(1)
         .format('mjpeg')
         .on('error', (err: Error) => {
@@ -97,7 +121,39 @@ export class FrameCaptureService implements OnModuleInit, OnModuleDestroy {
     return value;
   }
 
-  private getDevice(): string {
+  private getSource(): string {
+    const url = this.config.get<string>('FRAME_SOURCE_URL');
+    if (url) {
+      this.logger.debug(`Usando FRAME_SOURCE_URL=${url}`);
+      return url;
+    }
     return this.config.get<string>('WEBCAM_DEVICE', '/dev/video0');
+  }
+
+  // Preflight HTTP simples para detectar conexão recusada antes de invocar ffmpeg
+  private async preflightHttp(url: string): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(url, { method: 'GET', signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) {
+        this.logger.warn(`Preflight HTTP status ${res.status} para ${url}`);
+      }
+      return true; // mesmo status não 200 deixamos ffmpeg tentar (pode ser stream que não responde OK)
+    } catch (err: any) {
+      this.logger.error(`Preflight erro: ${err.message}`);
+      return false;
+    }
+  }
+
+  private handleFailure(message: string) {
+    this.consecutiveFailures++;
+    this.logger.error(message);
+    if (this.consecutiveFailures === 3) {
+      this.logger.warn('3 falhas consecutivas. Verifique se o VLC está servindo a URL e acessível do WSL.');
+      this.logger.warn('Dica VLC: Media > Stream > selecione dispositivo > Configure destino HTTP porta 8080, path /live, sem autenticação, formato MJPEG ou H264.');
+      this.logger.warn('No WSL, tente: curl -v http://localhost:8080/live para validar acesso direto.');
+    }
   }
 }

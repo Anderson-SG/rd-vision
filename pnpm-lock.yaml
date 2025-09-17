@@ -29,6 +29,9 @@ importers:
       fluent-ffmpeg:
         specifier: ^2.1.3
         version: 2.1.3
+      form-data:
+        specifier: ^4.0.4
+        version: 4.0.4
     devDependencies:
       '@swc/cli':
         specifier: ^0.7.8
